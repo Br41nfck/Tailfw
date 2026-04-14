@@ -1,15 +1,24 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <fstream>
 #include <string>
 #include <thread>
 #include <chrono>
 #include <sstream>
+#include <vector>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
 
 HWND g_hEdit = nullptr;
 HWND g_hWnd = nullptr;
 std::string g_filename;
 std::thread g_tailThread;
+std::thread g_uiUpdateThread;
 bool g_running = true;
+
+std::queue<std::string> g_lineQueue;
+std::mutex g_queueMutex;
+std::condition_variable g_queueCV;
 
 // Settings by default
 int g_windowWidth = 800;
@@ -23,8 +32,11 @@ int g_fontSize = 16;
 int g_fontWeight = FW_NORMAL;
 HFONT g_hFont = nullptr;
 
+const int UI_UPDATE_INTERVAL_MS = 100;
+
 // Functions Definitions
 static std::wstring Utf8ToWide(const std::string& utf8);
+static bool IsValidUtf8(const std::string& str);
 
 // Read config.ini
 static void LoadConfig() {
@@ -117,7 +129,6 @@ static void SaveConfig() {
     config << "FontWeight = " << g_fontWeight << "\n";
 }
 
-// Create font from settings
 static HFONT CreateConfiguredFont() {
     std::wstring wideFontName = Utf8ToWide(g_fontName);
 
@@ -140,94 +151,256 @@ static HFONT CreateConfiguredFont() {
     return CreateFontIndirectW(&lf);
 }
 
+// Проверка валидности UTF-8
+static bool IsValidUtf8(const std::string& str) {
+    if (str.empty()) return true;
+    
+    int expectedBytes = 0;
+    for (unsigned char c : str) {
+        if (expectedBytes == 0) {
+            if ((c & 0x80) == 0) continue;
+            else if ((c & 0xE0) == 0xC0) expectedBytes = 1;
+            else if ((c & 0xF0) == 0xE0) expectedBytes = 2;
+            else if ((c & 0xF8) == 0xF0) expectedBytes = 3;
+            else return false;
+        } else {
+            if ((c & 0xC0) != 0x80) return false;
+            expectedBytes--;
+        }
+    }
+    return expectedBytes == 0;
+}
+
 static std::wstring Utf8ToWide(const std::string& utf8) {
     if (utf8.empty()) return L"";
+    
+    if (!IsValidUtf8(utf8)) {
+        int wideSize = MultiByteToWideChar(CP_ACP, 0, utf8.c_str(), -1, NULL, 0);
+        if (wideSize > 0) {
+            std::wstring wide(wideSize - 1, 0);
+            MultiByteToWideChar(CP_ACP, 0, utf8.c_str(), -1, &wide[0], wideSize);
+            return wide;
+        }
+        return L"[Invalid encoding]";
+    }
+    
     int wideSize = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, NULL, 0);
+    if (wideSize == 0) {
+        return L"[Conversion error]";
+    }
+    
     std::wstring wide(wideSize - 1, 0);
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wide[0], wideSize);
     return wide;
 }
 
-static void AddTextToWindow(const std::string& text) {
-    if (g_hEdit) {
-        std::wstring wideText = Utf8ToWide(text);
-        int textLength = GetWindowTextLengthW(g_hEdit);
-        SendMessageW(g_hEdit, EM_SETSEL, textLength, textLength);
-        SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)(wideText + L"\r\n").c_str());
-        SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
+static void AddTextToWindowInternal(const std::string& text) {
+    if (!g_hEdit) return;
+    
+    std::wstring wideText = Utf8ToWide(text);
+    int textLength = GetWindowTextLengthW(g_hEdit);
+    
+    if (textLength > 10 * 1024 * 1024) { // 10 MB
+        SendMessageW(g_hEdit, EM_SETSEL, 0, 1024 * 1024);
+        SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        textLength = GetWindowTextLengthW(g_hEdit);
+    }
+    
+    SendMessageW(g_hEdit, EM_SETSEL, textLength, textLength);
+    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)(wideText + L"\r\n").c_str());
+    SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
+}
+
+static void QueueLineForUI(const std::string& line) {
+    if (line.empty()) return;
+    
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        g_lineQueue.push(line);
+    }
+    g_queueCV.notify_one();
+}
+
+static void UIUpdateThread() {
+    while (g_running) {
+        std::vector<std::string> linesToProcess;
+        
+        {
+            std::unique_lock<std::mutex> lock(g_queueMutex);
+            g_queueCV.wait_for(lock, std::chrono::milliseconds(UI_UPDATE_INTERVAL_MS), [] {
+                return !g_lineQueue.empty() || !g_running;
+            });
+            
+            if (!g_running) break;
+            
+            while (!g_lineQueue.empty()) {
+                linesToProcess.push_back(g_lineQueue.front());
+                g_lineQueue.pop();
+            }
+        }
+        
+        if (!linesToProcess.empty()) {
+            for (const auto& line : linesToProcess) {
+                AddTextToWindowInternal(line);
+            }
+        }
     }
 }
 
 static void TailFileThread() {
-    std::ifstream file(g_filename, std::ios::binary);
-
-    if (!file.is_open()) {
-        AddTextToWindow("Cannot open file: " + g_filename);
-        return;
-    }
-
-    file.seekg(0, std::ios::end);
-    std::streampos lastPos = file.tellg();
-    file.clear();
-
+    std::ifstream file;
+    std::streampos lastPos = 0;
+    std::string incompleteLine;
+    int errorCount = 0;
+    const int MAX_ERRORS = 5;
+    std::string utf8Buffer;
+    
+  //  QueueLineForUI("[Started monitoring file: " + g_filename + "]");
+    
     while (g_running) {
-        WIN32_FILE_ATTRIBUTE_DATA fileInfo;
-        long long currentSize = 0;
-
-        if (GetFileAttributesExA(g_filename.c_str(), GetFileExInfoStandard, &fileInfo)) {
+        try {
+            WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+            if (!GetFileAttributesExA(g_filename.c_str(), GetFileExInfoStandard, &fileInfo)) {
+                if (file.is_open()) {
+                    file.close();
+                    QueueLineForUI("[File deleted? Waiting...]");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                lastPos = 0;
+                incompleteLine.clear();
+                utf8Buffer.clear();
+                continue;
+            }
+            
             LARGE_INTEGER size{};
             size.HighPart = fileInfo.nFileSizeHigh;
             size.LowPart = fileInfo.nFileSizeLow;
-            currentSize = size.QuadPart;
-        }
+            long long currentSize = size.QuadPart;
 
-        if (currentSize > lastPos) {
-            file.close();
-            file.open(g_filename, std::ios::binary);
-
-            if (file.is_open()) {
+            if (!file.is_open()) {
+                file.open(g_filename, std::ios::binary);
+                if (!file.is_open()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
+                
+                if (lastPos > currentSize) {
+                    QueueLineForUI("[File truncated or recreated]");
+                    lastPos = 0;
+                    incompleteLine.clear();
+                    utf8Buffer.clear();
+                }
+                
                 file.seekg(lastPos);
-                file.clear();
-
-                std::string newData;
-                newData.resize(currentSize - lastPos);
-                file.read(&newData[0], newData.size());
-
-                std::string line;
-                for (size_t i = 0; i < newData.size(); ++i) {
-                    char c = newData[i];
-
+                if (file.fail()) {
+                    file.clear();
+                    lastPos = 0;
+                    file.seekg(0);
+                }
+                errorCount = 0;
+            }
+            
+            if (currentSize < lastPos) {
+                QueueLineForUI("[File truncated]");
+                file.close();
+                lastPos = 0;
+                incompleteLine.clear();
+                utf8Buffer.clear();
+                continue;
+            }
+            
+            const long long CHUNK_SIZE = 65536; // 64 KB
+            long long bytesToRead = currentSize - lastPos;
+            
+            if (bytesToRead <= 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            
+            if (bytesToRead > CHUNK_SIZE) {
+                bytesToRead = CHUNK_SIZE;
+            }
+            
+            std::vector<char> buffer(bytesToRead);
+            file.read(buffer.data(), bytesToRead);
+            std::streamsize bytesRead = file.gcount();
+            
+            if (bytesRead > 0) {
+                for (std::streamsize i = 0; i < bytesRead; ++i) {
+                    char c = buffer[i];
+                    
                     if (c == '\r') {
                         continue;
                     }
-                    else if (c == '\n') {
-                        AddTextToWindow(line);
-                        line.clear();
+                    
+                    if (c == '\n') {
+                        if (!incompleteLine.empty()) {
+                            QueueLineForUI(incompleteLine);
+                            incompleteLine.clear();
+                        } else {
+                            QueueLineForUI("");
+                        }
+                        utf8Buffer.clear();
+                    } else {
+                        incompleteLine += c;
+                        
+                        if (!incompleteLine.empty()) {
+                            unsigned char lastByte = incompleteLine.back();
+                            if ((lastByte & 0xC0) == 0x80) {
+                                utf8Buffer += c;
+                            } else {
+                                utf8Buffer.clear();
+                            }
+                        }
                     }
-                    else {
-                        line += c;
+                }
+                
+                lastPos += bytesRead;
+                
+                if (file.fail() && !file.eof()) {
+                    file.clear();
+                    std::streampos actualPos = file.tellg();
+                    if (actualPos != std::streampos(-1)) {
+                        lastPos = actualPos;
                     }
                 }
-
-                if (!line.empty()) {
-                    AddTextToWindow(line);
+                
+                errorCount = 0;
+            } else {
+                errorCount++;
+                if (errorCount > MAX_ERRORS) {
+                    QueueLineForUI("[Error: Unable to read file, retrying...]");
+                    file.close();
+                    errorCount = 0;
                 }
-
-                lastPos = file.tellg();
-                if (lastPos == -1) {
-                    lastPos = currentSize;
-                }
-
                 file.clear();
             }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            
+        } catch (const std::exception& e) {
+            QueueLineForUI("[Exception: " + std::string(e.what()) + "]");
+            errorCount++;
+            if (errorCount > MAX_ERRORS) {
+                file.close();
+                errorCount = 0;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        } catch (...) {
+            QueueLineForUI("[Unknown exception occurred]");
+            errorCount++;
+            if (errorCount > MAX_ERRORS) {
+                file.close();
+                errorCount = 0;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
-        else if (currentSize < lastPos) {
-            AddTextToWindow("[File truncated]");
-            lastPos = 0;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    
+    if (!incompleteLine.empty()) {
+        QueueLineForUI(incompleteLine);
+    }
+    // QueueLineForUI("[Monitoring stopped]");
 }
 
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -245,22 +418,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             GetModuleHandleW(NULL),
             NULL
         );
-
-        // Create font from config settings
+        
+        SendMessageW(g_hEdit, EM_LIMITTEXT, 0, 0);
+        
         g_hFont = CreateConfiguredFont();
         if (g_hFont) {
             SendMessageW(g_hEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
         }
+        
+        g_uiUpdateThread = std::thread(UIUpdateThread);
     }
     break;
-
+    
     case WM_SIZE:
     {
         if (wParam != SIZE_MINIMIZED) {
             RECT rc;
             GetClientRect(hWnd, &rc);
             SetWindowPos(g_hEdit, NULL, 0, 0, rc.right, rc.bottom, SWP_NOZORDER);
-
+            
             if (rc.right != g_windowWidth || rc.bottom != g_windowHeight) {
                 g_windowWidth = rc.right;
                 g_windowHeight = rc.bottom;
@@ -269,7 +445,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         }
     }
     break;
-
+    
     case WM_MOVE:
     {
         if (!IsIconic(hWnd)) {
@@ -283,18 +459,29 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         }
     }
     break;
-
+    
+    case WM_CLOSE:
+        g_running = false;
+        g_queueCV.notify_all();
+        DestroyWindow(hWnd);
+        break;
+        
     case WM_DESTROY:
         g_running = false;
+        g_queueCV.notify_all();
+        
         if (g_tailThread.joinable()) {
             g_tailThread.join();
+        }
+        if (g_uiUpdateThread.joinable()) {
+            g_uiUpdateThread.join();
         }
         if (g_hFont) {
             DeleteObject(g_hFont);
         }
         PostQuitMessage(0);
         break;
-
+        
     default:
         return DefWindowProcW(hWnd, message, wParam, lParam);
     }
@@ -303,25 +490,25 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 
 int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPSTR lpCmdLine, _In_ int nCmdShow) {
     LoadConfig();
-
+    
     std::string cmdLine = lpCmdLine;
-
+    
     if (!cmdLine.empty() && cmdLine.front() == '"') {
         cmdLine = cmdLine.substr(1, cmdLine.length() - 2);
     }
-
+    
     if (cmdLine.empty()) {
         MessageBoxW(NULL, L"Usage: tailfw.exe <filename>", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
-
+    
     g_filename = cmdLine;
-
+    
     std::wstring wideFilename = Utf8ToWide(g_filename);
     std::wstring windowTitle = L"Tail -f (w) | " + wideFilename;
-
+    
     const wchar_t CLASS_NAME[] = L"TailWindowClass";
-
+    
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.lpfnWndProc = WndProc;
@@ -329,9 +516,9 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
     wc.lpszClassName = CLASS_NAME;
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-
+    
     RegisterClassExW(&wc);
-
+    
     g_hWnd = CreateWindowExW(
         0,
         CLASS_NAME,
@@ -343,22 +530,22 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _
         hInstance,
         NULL
     );
-
+    
     if (!g_hWnd) {
         MessageBoxW(NULL, L"Failed to create window", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
-
+    
     ShowWindow(g_hWnd, nCmdShow);
     UpdateWindow(g_hWnd);
-
+    
     g_tailThread = std::thread(TailFileThread);
-
+    
     MSG msg = {};
     while (GetMessageW(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-
+    
     return 0;
 }
