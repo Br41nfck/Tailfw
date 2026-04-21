@@ -1,4 +1,4 @@
-#include <windows.h>
+﻿#include <windows.h>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -9,6 +9,7 @@
 #include <queue>
 #include <condition_variable>
 
+#define WM_APPEND_TEXT (WM_USER + 1)
 HWND g_hEdit = nullptr;
 HWND g_hWnd = nullptr;
 std::string g_filename;
@@ -212,14 +213,13 @@ static void AddTextToWindowInternal(const std::string& text) {
 }
 
 static void QueueLineForUI(const std::string& line) {
-    if (line.empty()) return;
-    
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
         g_lineQueue.push(line);
     }
     g_queueCV.notify_one();
 }
+
 
 static void UIUpdateThread() {
     while (g_running) {
@@ -239,10 +239,9 @@ static void UIUpdateThread() {
             }
         }
         
-        if (!linesToProcess.empty()) {
-            for (const auto& line : linesToProcess) {
-                AddTextToWindowInternal(line);
-            }
+        for (const auto& line : linesToProcess) {
+            std::wstring* text = new std::wstring(Utf8ToWide(line));
+            PostMessageW(g_hWnd, WM_APPEND_TEXT, 0, (LPARAM)text);
         }
     }
 }
@@ -255,7 +254,7 @@ static void TailFileThread() {
     const int MAX_ERRORS = 5;
     std::string utf8Buffer;
     
-  //  QueueLineForUI("[Started monitoring file: " + g_filename + "]");
+    //  QueueLineForUI("[Started monitoring file: " + g_filename + "]");
     
     while (g_running) {
         try {
@@ -280,12 +279,20 @@ static void TailFileThread() {
             if (!file.is_open()) {
                 file.open(g_filename, std::ios::binary);
                 if (!file.is_open()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    QueueLineForUI("[ERROR] Cannot open file: " + g_filename);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     continue;
                 }
+
+                file.seekg(0, std::ios::end);
+                lastPos = file.tellg();
+
+                // QueueLineForUI("[Started monitoring new lines]");
+                errorCount = 0;
+                continue;
                 
                 if (lastPos > currentSize) {
-                    QueueLineForUI("[File truncated or recreated]");
+                  //  QueueLineForUI("[File truncated or recreated]");
                     lastPos = 0;
                     incompleteLine.clear();
                     utf8Buffer.clear();
@@ -301,13 +308,12 @@ static void TailFileThread() {
             }
             
             if (currentSize < lastPos) {
-                QueueLineForUI("[File truncated]");
+                // QueueLineForUI("[File truncated]");
                 file.close();
+
                 lastPos = 0;
-                incompleteLine.clear();
-                utf8Buffer.clear();
                 continue;
-            }
+}
             
             const long long CHUNK_SIZE = 65536; // 64 KB
             long long bytesToRead = currentSize - lastPos;
@@ -427,6 +433,29 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         }
         
         g_uiUpdateThread = std::thread(UIUpdateThread);
+    }
+    break;
+    
+    case WM_APPEND_TEXT:
+    {
+        std::wstring* text = (std::wstring*)lParam;
+        if (text && g_hEdit) {
+            int textLength = GetWindowTextLengthW(g_hEdit);
+
+            // Ограничение буфера
+            if (textLength > 10 * 1024 * 1024) {
+                SendMessageW(g_hEdit, EM_SETSEL, 0, 1024 * 1024);
+                SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+                textLength = GetWindowTextLengthW(g_hEdit);
+            }
+
+            SendMessageW(g_hEdit, EM_SETSEL, textLength, textLength);
+            SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)text->c_str());
+            SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
+            SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
+
+            delete text;
+        }
     }
     break;
     
